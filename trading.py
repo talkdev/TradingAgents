@@ -341,6 +341,13 @@ def analyze_stocks():
     config["max_debate_rounds"] = 2
     config["max_risk_discuss_rounds"] = 1
     
+    # ====================================================
+    # ADD THESE DATA TRUNCATION LIMITS TO PREVENT 400 ERRORS
+    # ====================================================
+    config["news_article_limit"] = 5         # Default is 20. Cuts ticker news heavily.
+    config["global_news_article_limit"] = 3  # Default is 10. Cuts macro news heavily.
+    # ====================================================
+
     config["global_news_queries"] = [
         "RBI Reserve Bank of India interest rates inflation",
         "Nifty 50 Sensex Indian economy GDP",
