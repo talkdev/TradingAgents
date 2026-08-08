@@ -5,31 +5,31 @@ import re
 import sqlite3
 import threading
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 # ==========================================
-# 1. Base Configuration Variables (Linux)
+# 1. Hardcoded Configuration Variables
 # ==========================================
 MAX_WORKERS = 6  # Process exactly 6 stocks in parallel at a time
-
-BASE_DIR = "/root/TradingAI"
-TRADINGAGENTS_PATH = os.path.join(BASE_DIR, "TradingAgents")
-BASE_OUTPUT_FOLDER = os.path.join(TRADINGAGENTS_PATH, "reports")
-STOCKS_FILE = os.path.join(TRADINGAGENTS_PATH, "stocks.txt")
+STOCKS_FILE = r"stocks.txt"  # Path to your stocks.txt file
+BASE_OUTPUT_FOLDER = r"C:\Users\Administrator\Desktop\TradingAgents\reports"
+TRADINGAGENTS_PATH = r"C:\Users\Administrator\Desktop\TradingAgents"
 DB_PATH = os.path.join(BASE_OUTPUT_FOLDER, "trading_history.db")
 
 if TRADINGAGENTS_PATH not in sys.path:
     sys.path.append(TRADINGAGENTS_PATH)
 
-# Set local dummy API key for local vLLM instance
-os.environ["OPENAI_API_KEY"] = "local-dummy-key"
+# Set OpenAI API key securely from environment variable
+os.environ["OPENAI_API_KEY"] = os.getenv(
+    "OPENAI_API_KEY", 
+    "sk-"
+)
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
 
-# Global thread lock for safe database operations
+# Global thread lock for safe database/dictionary operations
 db_lock = threading.Lock()
 
 
@@ -44,6 +44,7 @@ def init_db(db_path, tickers):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Create table with run_date as primary key if it doesn't exist
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_signals (
             run_date TEXT PRIMARY KEY
@@ -51,9 +52,11 @@ def init_db(db_path, tickers):
     """)
     conn.commit()
 
+    # Inspect existing columns
     cursor.execute("PRAGMA table_info(stock_signals)")
     existing_cols = {col[1] for col in cursor.fetchall()}
 
+    # Add missing ticker columns dynamically
     for ticker in tickers:
         col_name = ticker  # Retain full ticker name (e.g., "RELIANCE.NS")
         if col_name not in existing_cols:
@@ -72,8 +75,10 @@ def record_run_to_db(db_path, target_date, status_dict):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
+        # Insert date row if missing
         cursor.execute("INSERT OR IGNORE INTO stock_signals (run_date) VALUES (?)", (target_date,))
         
+        # Update each stock status for target_date
         for ticker, stance in status_dict.items():
             query = f'UPDATE stock_signals SET "{ticker}" = ? WHERE run_date = ?'
             cursor.execute(query, (stance, target_date))
@@ -91,6 +96,7 @@ def generate_change_report(db_path, target_date, output_folder):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Get all distinct run dates sorted descending
     cursor.execute("SELECT run_date FROM stock_signals ORDER BY run_date DESC LIMIT 2")
     dates = [row[0] for row in cursor.fetchall()]
 
@@ -106,7 +112,7 @@ def generate_change_report(db_path, target_date, output_folder):
         cursor.execute("PRAGMA table_info(stock_signals)")
         cols = [col[1] for col in cursor.fetchall() if col[1] != "run_date"]
         
-        cursor.execute("SELECT * FROM stock_signals WHERE run_date = ?", (target_date,))
+        cursor.execute(f"SELECT * FROM stock_signals WHERE run_date = ?", (target_date,))
         row = cursor.fetchone()
         
         if row:
@@ -125,6 +131,7 @@ def generate_change_report(db_path, target_date, output_folder):
 
     current_date, prev_date = dates[0], dates[1]
 
+    # Fetch current and previous row
     cursor.execute("SELECT * FROM stock_signals WHERE run_date = ?", (current_date,))
     curr_row = dict(zip([d[0] for d in cursor.description], cursor.fetchone()))
 
@@ -133,6 +140,7 @@ def generate_change_report(db_path, target_date, output_folder):
 
     conn.close()
 
+    # Identify changes
     changes = []
     unchanged = []
 
@@ -147,6 +155,7 @@ def generate_change_report(db_path, target_date, output_folder):
         elif curr_val:
             unchanged.append((col, curr_val))
 
+    # Build Markdown Report
     report_md = f"# Trading Signal Change Report — {current_date}\n"
     report_md += f"**Comparison Window:** `{prev_date}` $\\rightarrow$ `{current_date}`\n\n"
     report_md += "---\n\n"
@@ -200,6 +209,9 @@ def load_tickers_from_file(file_path):
 
 
 def parse_stance_from_summary(summary_path):
+    """
+    Extracts the stance (BUY, SHORT, NO TRADE, HOLD, etc.) from summary.md.
+    """
     if not os.path.exists(summary_path):
         return "UNKNOWN"
 
@@ -210,6 +222,7 @@ def parse_stance_from_summary(summary_path):
     if match:
         return match.group(1).strip().upper()
 
+    # Fallback search if format varies
     if "BUY" in text.upper():
         return "BUY"
     elif "SHORT" in text.upper() or "SELL" in text.upper():
@@ -236,12 +249,7 @@ def generate_ai_summary(ticker, target_date, report_dir):
         print(f"[!] No raw reports found in {report_dir} to summarize.")
         return "UNKNOWN"
 
-    # Connect to local vLLM server
-    client = OpenAI(
-        base_url="http://127.0.0.1:8000/v1",
-        api_key="local-dummy-key"
-    )
-
+    client = OpenAI()
     system_prompt = (
         "You are a Lead Quantitative Swing Trader. Evaluate this stock strictly as a SHORT-TERM SWING TRADE setup (5 to 20 days).\n\n"
         "Your output MUST follow this exact Markdown structure:\n\n"
@@ -264,7 +272,7 @@ def generate_ai_summary(ticker, target_date, report_dir):
     
     try:
         response = client.chat.completions.create(
-            model="Qwen2.5-72B-Instruct-AWQ",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": combined_reports_text}
@@ -282,7 +290,7 @@ def generate_ai_summary(ticker, target_date, report_dir):
         return parse_stance_from_summary(summary_file_path)
         
     except Exception as e:
-        print(f"[!] Failed to generate local Qwen summary for {ticker}: {str(e)}")
+        print(f"[!] Failed to generate OpenAI summary for {ticker}: {str(e)}")
         return "ERROR"
 
 
@@ -316,6 +324,7 @@ def process_single_stock(ticker, target_date, base_output_folder, config):
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(content)
         
+        # Generate summary and return extracted stance
         stance = generate_ai_summary(ticker, target_date, report_dir)
         print(f"[✔ COMPLETED] Finished {ticker} | Final Stance: {stance}")
         return ticker, stance
@@ -332,12 +341,9 @@ def analyze_stocks():
     config = DEFAULT_CONFIG.copy()
     os.makedirs(BASE_OUTPUT_FOLDER, exist_ok=True)
     
-    # Local vLLM Configuration
-    config["llm_provider"] = "openai_compatible"
-    config["backend_url"] = "http://127.0.0.1:8000/v1"
-    config["deep_think_llm"] = "Qwen2.5-72B-Instruct-AWQ"
-    config["quick_think_llm"] = "Qwen2.5-72B-Instruct-AWQ"
-    
+    config["llm_provider"] = "openai"
+    config["deep_think_llm"] = "gpt-5.5"
+    config["quick_think_llm"] = "gpt-5.4-mini"
     config["max_debate_rounds"] = 2
     config["max_risk_discuss_rounds"] = 1
     
@@ -353,15 +359,13 @@ def analyze_stocks():
         print(f"[!] No valid tickers found in '{STOCKS_FILE}'. Exiting.")
         return
 
-    # Use India Time (Asia/Kolkata) to prevent UTC date mismatches on cloud servers
-    target_date = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    target_date = datetime.now().strftime("%Y-%m-%d")
 
     # Step 1: Initialize DB schema dynamically for all loaded tickers
     init_db(DB_PATH, tickers)
 
     print(f"\n{'='*70}")
     print(f"  PARALLEL PROCESSING ENGINE STARTED")
-    print(f"  Target Analysis Date: {target_date}")
     print(f"  Total Tickers Loaded: {len(tickers)}")
     print(f"  Parallel Concurrency: {MAX_WORKERS} Workers")
     print(f"  Base Output Directory: {BASE_OUTPUT_FOLDER}")
