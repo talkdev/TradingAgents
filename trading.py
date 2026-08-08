@@ -4,6 +4,7 @@ import glob
 import re
 import sqlite3
 import threading
+from copy import deepcopy
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -329,7 +330,9 @@ def process_single_stock(ticker, target_date, base_output_folder, config):
 # 4. Main Execution Engine
 # ==========================================
 def analyze_stocks():
-    config = DEFAULT_CONFIG.copy()
+    # The default contains nested dictionaries; take a deep copy so this
+    # runner's optional-source policy cannot leak into another graph instance.
+    config = deepcopy(DEFAULT_CONFIG)
     os.makedirs(BASE_OUTPUT_FOLDER, exist_ok=True)
     
     # Local vLLM Configuration
@@ -341,12 +344,13 @@ def analyze_stocks():
     config["max_debate_rounds"] = 2
     config["max_risk_discuss_rounds"] = 1
     
-    # ---------------------------------------------------------
-    # OPTIONAL FIX: Disable Polymarket to stop DNS error logs
-    # ---------------------------------------------------------
-    if "data_vendors" not in config:
-        config["data_vendors"] = {}
-    config["data_vendors"]["prediction_markets"] = None 
+    # These public/optional sources are not dependable for a parallel NSE
+    # batch: FRED requires a key, Polymarket can be DNS-blocked, StockTwits
+    # lacks many NSE cashtags, and Reddit throttles anonymous RSS traffic.
+    # Disable them explicitly instead of issuing failing calls for every stock.
+    config["data_vendors"]["macro_data"] = "disabled"
+    config["data_vendors"]["prediction_markets"] = "disabled"
+    config["social_sources"] = {"stocktwits": False, "reddit": False}
     
     # India-specific queries
     config["global_news_queries"] = [

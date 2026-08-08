@@ -42,6 +42,7 @@ from tradingagents.agents.utils.structured import (
 )
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.config import get_config
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -68,8 +69,20 @@ def create_sentiment_analyst(llm):
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        # Public social endpoints are frequently unavailable or rate-limited
+        # in batch jobs.  Entry points can opt out without generating one
+        # failed request per ticker; news remains available for sentiment.
+        social_sources = get_config().get("social_sources", {})
+        stocktwits_block = (
+            fetch_stocktwits_messages(ticker, limit=30)
+            if social_sources.get("stocktwits", True)
+            else "<StockTwits disabled by configuration for this run>"
+        )
+        reddit_block = (
+            fetch_reddit_posts(ticker)
+            if social_sources.get("reddit", True)
+            else "<Reddit disabled by configuration for this run>"
+        )
 
         system_message = _build_system_message(
             ticker=ticker,

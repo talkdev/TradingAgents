@@ -169,6 +169,16 @@ def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
+    # Optional enrichments can be deliberately disabled by an entry point.
+    # This is different from a broken/missing vendor: do not attempt a request
+    # and do not emit an error for every stock or LLM tool call.
+    if vendor_config is None or str(vendor_config).strip().lower() in {"", "disabled", "none", "off"}:
+        if category in OPTIONAL_CATEGORIES:
+            return (
+                f"DATA_UNAVAILABLE: optional {category} is disabled by configuration. "
+                "Proceed without it; do not fabricate values."
+            )
+        raise ValueError(f"No vendor configured for required category '{category}'.")
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
 
     if method not in VENDOR_METHODS:
