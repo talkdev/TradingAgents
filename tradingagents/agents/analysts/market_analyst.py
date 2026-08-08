@@ -67,7 +67,7 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
                     " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
                     " You have access to the following tools: {tool_names}."
                     " Today's date is {current_date}; treat it as 'now' for all analysis and tool-call date ranges. {instrument_context}\n"
-                    "{system_message}",
+                    "{system_message}"
                 ),
                 MessagesPlaceholder(variable_name="messages"),
             ]
