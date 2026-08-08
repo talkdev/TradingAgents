@@ -1,541 +1,633 @@
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 
-###############################################################################
-# TradingAgents + Local Qwen2.5-72B + vLLM
-#
-# GPU:
-#   RTX PRO 6000 96GB
-#
-# Repository:
-#   https://github.com/talkdev/TradingAgents
-#
-# This script:
-#   1. Installs system dependencies
-#   2. Clones your TradingAgents repository
-#   3. Creates Python virtual environment
-#   4. Installs TradingAgents
-#   5. Installs vLLM
-#   6. Downloads Qwen2.5-72B-Instruct-AWQ
-#   7. Configures TradingAgents for local vLLM
-#   8. Starts Qwen
-#   9. Tests Qwen
-#  10. Runs trading.py
-###############################################################################
-
-echo
-echo "=============================================================="
-echo " TradingAgents Local AI Deployment"
-echo " RTX PRO 6000 96GB"
-echo " Qwen2.5-72B-Instruct-AWQ"
-echo "=============================================================="
-echo
-
-###############################################################################
-# CONFIGURATION
-###############################################################################
-
-BASE_DIR="${HOME}/TradingAI"
-
+BASE_DIR="/root/TradingAI"
+REPO_DIR="${BASE_DIR}/TradingAgents"
 REPO_URL="https://github.com/talkdev/TradingAgents.git"
-
-TRADINGAGENTS_DIR="${BASE_DIR}/TradingAgents"
-VENV_DIR="${BASE_DIR}/venv"
-MODEL_DIR="${BASE_DIR}/models/Qwen2.5-72B-Instruct-AWQ"
-REPORT_DIR="${TRADINGAGENTS_DIR}/reports"
-
-MODEL_REPO="Qwen/Qwen2.5-72B-Instruct-AWQ"
+REPO_BRANCH="main"
+VENV="${BASE_DIR}/venv"
 MODEL_NAME="Qwen2.5-72B-Instruct-AWQ"
+MODEL_REPO="Qwen/Qwen2.5-72B-Instruct-AWQ"
+MODEL_DIR="${BASE_DIR}/models/${MODEL_NAME}"
+PYTHON="${VENV}/bin/python"
+PIP="${VENV}/bin/pip"
+VLLM="${VENV}/bin/vllm"
+HF="${VENV}/bin/hf"
+HOST="127.0.0.1"
+PORT="8000"
+API_KEY="local-dummy-key"
+TP_SIZE=1
+MAX_MODEL_LEN=16384
+MAX_NUM_SEQS=6
+MAX_WORKERS=6
+GPU_UTILIZATION=0.90
+VLLM_PID="${BASE_DIR}/vllm.pid"
+VLLM_LOG="${BASE_DIR}/vllm.log"
 
-VLLM_HOST="127.0.0.1"
-VLLM_PORT="8000"
-
-GPU_MEMORY_UTILIZATION="0.92"
-MAX_MODEL_LEN="16384"
-MAX_NUM_SEQS="6"
-
-MAX_WORKERS="6"
-
-###############################################################################
-# 1. GPU CHECK
-###############################################################################
-
-echo "[1/10] Checking GPU..."
-
-if ! command -v nvidia-smi >/dev/null 2>&1; then
+log() {
     echo
-    echo "ERROR: NVIDIA driver / nvidia-smi not available."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+die() {
+    echo
+    echo "ERROR: $*"
     exit 1
-fi
+}
+
+[ "$(id -u)" -eq 0 ] || die "Run this script as root."
+
+mkdir -p "${BASE_DIR}" "${BASE_DIR}/models"
+
+# -----------------------------------------------------------------------------
+# GPU
+# -----------------------------------------------------------------------------
+
+log "Checking GPU"
+
+command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found."
 
 nvidia-smi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 
-echo
-echo "Detected GPU count: ${GPU_COUNT}"
+echo "GPU       : ${GPU_NAME}"
+echo "GPU count : ${GPU_COUNT}"
+echo "VRAM      : ${GPU_VRAM} MiB"
 
-if [ "${GPU_COUNT}" -ne 1 ]; then
-    echo
-    echo "WARNING: This setup is designed for 1 GPU."
-    echo "Detected ${GPU_COUNT} GPUs."
-fi
+[ "${GPU_COUNT}" -eq 1 ] || die "This setup requires exactly one GPU."
 
-###############################################################################
-# 2. SYSTEM PACKAGES
-###############################################################################
+# -----------------------------------------------------------------------------
+# System packages
+# -----------------------------------------------------------------------------
 
-echo
-echo "[2/10] Installing system packages..."
+log "Installing system packages"
 
-sudo apt-get update
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    git curl wget jq procps psmisc util-linux \
+    build-essential python3 python3-pip python3-venv python3-dev
 
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git \
-    curl \
-    wget \
-    build-essential \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    tmux \
-    htop \
-    nvtop \
-    jq
+# -----------------------------------------------------------------------------
+# Repository
+# -----------------------------------------------------------------------------
 
-###############################################################################
-# 3. CREATE BASE DIRECTORY
-###############################################################################
+log "Preparing TradingAgents repository"
 
-echo
-echo "[3/10] Creating directories..."
-
-mkdir -p "${BASE_DIR}"
-mkdir -p "${BASE_DIR}/models"
-mkdir -p "${REPORT_DIR}"
-
-###############################################################################
-# 4. CLONE YOUR REPOSITORY
-###############################################################################
-
-echo
-echo "[4/10] Cloning TradingAgents repository..."
-
-if [ -d "${TRADINGAGENTS_DIR}/.git" ]; then
-
-    echo "Repository already exists."
-    echo "Updating repository..."
-
-    cd "${TRADINGAGENTS_DIR}"
-
-    git fetch origin
-    git checkout main
-    git pull --ff-only
-
+if [ -d "${REPO_DIR}/.git" ]; then
+    cd "${REPO_DIR}"
+    echo "Existing repository found."
+    if git diff --quiet && git diff --cached --quiet; then
+        git fetch origin
+        git checkout "${REPO_BRANCH}"
+        git pull --ff-only origin "${REPO_BRANCH}"
+    else
+        echo "WARNING: Local Git changes detected."
+        echo "Keeping local changes; repository will not be reset."
+    fi
 else
-
-    rm -rf "${TRADINGAGENTS_DIR}"
-
-    git clone \
-        "${REPO_URL}" \
-        "${TRADINGAGENTS_DIR}"
-
+    if [ -e "${REPO_DIR}" ]; then
+        die "${REPO_DIR} exists but is not a Git repository."
+    fi
+    git clone --branch "${REPO_BRANCH}" --single-branch "${REPO_URL}" "${REPO_DIR}"
 fi
 
-echo
-echo "Repository:"
-echo "${TRADINGAGENTS_DIR}"
-
-cd "${TRADINGAGENTS_DIR}"
+cd "${REPO_DIR}"
 
 echo
-echo "Latest commit:"
-git log -1 --oneline
+echo "Repository : ${REPO_DIR}"
+echo "Remote     : $(git remote get-url origin)"
+echo "Commit     : $(git rev-parse --short HEAD)"
 
-###############################################################################
-# 5. PYTHON ENVIRONMENT
-###############################################################################
+# -----------------------------------------------------------------------------
+# Python environment
+# -----------------------------------------------------------------------------
 
-echo
-echo "[5/10] Creating Python virtual environment..."
+log "Preparing Python environment"
 
-if [ ! -d "${VENV_DIR}" ]; then
-    python3 -m venv "${VENV_DIR}"
+if [ ! -x "${PYTHON}" ]; then
+    python3 -m venv "${VENV}"
 fi
 
-source "${VENV_DIR}/bin/activate"
+"${PYTHON}" --version
 
-python --version
+"${PIP}" install --upgrade pip wheel
+"${PIP}" install --force-reinstall "setuptools>=77.0.3,<81.0.0"
 
-pip install --upgrade pip setuptools wheel
+# -----------------------------------------------------------------------------
+# PyTorch
+# -----------------------------------------------------------------------------
 
-###############################################################################
-# 6. PYTORCH + vLLM + TRADINGAGENTS
-###############################################################################
+log "Checking PyTorch"
 
-echo
-echo "[6/10] Installing Python dependencies..."
+if ! "${PYTHON}" -c "import torch" >/dev/null 2>&1; then
+    "${PIP}" install torch
+fi
 
-pip install \
-    torch \
-    torchvision \
-    torchaudio \
-    --index-url https://download.pytorch.org/whl/cu128
+"${PYTHON}" - <<'PY'
+import torch
 
-echo
-echo "Installing vLLM..."
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA runtime:", torch.version.cuda)
 
-pip install vllm
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is not available.")
 
-echo
-echo "Installing TradingAgents..."
+print("GPU:", torch.cuda.get_device_name(0))
+print("VRAM:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2), "GB")
+PY
 
-cd "${TRADINGAGENTS_DIR}"
+# -----------------------------------------------------------------------------
+# vLLM
+# -----------------------------------------------------------------------------
 
-pip install -e .
+log "Checking vLLM"
 
-echo
-echo "Installing Hugging Face tools..."
+if ! "${PYTHON}" -c "import vllm" >/dev/null 2>&1; then
+    "${PIP}" install vllm
+fi
 
-pip install \
-    huggingface_hub \
+"${PIP}" install --force-reinstall "setuptools>=77.0.3,<81.0.0"
+
+# -----------------------------------------------------------------------------
+# Hugging Face CLI
+# -----------------------------------------------------------------------------
+
+log "Installing Hugging Face CLI"
+
+"${PIP}" install --upgrade "huggingface_hub[cli]"
+
+[ -x "${HF}" ] || die "Hugging Face CLI not found at ${HF}."
+
+"${HF}" --version
+
+# -----------------------------------------------------------------------------
+# TradingAgents dependencies
+# -----------------------------------------------------------------------------
+
+log "Installing TradingAgents"
+
+cd "${REPO_DIR}"
+
+"${PIP}" install \
     transformers \
     accelerate \
     safetensors \
     sentencepiece
 
-###############################################################################
-# 7. VERIFY PYTORCH / GPU
-###############################################################################
+"${PIP}" install -e .
+
+# TradingAgents installation may change setuptools.
+"${PIP}" install --force-reinstall "setuptools>=77.0.3,<81.0.0"
 
 echo
-echo "Checking PyTorch..."
+echo "Installed versions:"
+"${PIP}" show setuptools | grep '^Version:' || true
+"${PIP}" show torch | grep '^Version:' || true
+"${PIP}" show vllm | grep '^Version:' || true
 
-python - <<'PY'
+# -----------------------------------------------------------------------------
+# Qwen model
+# -----------------------------------------------------------------------------
 
-import torch
+log "Checking Qwen model"
 
-print()
-print("==============================================")
-print(" PyTorch / GPU")
-print("==============================================")
-
-print("PyTorch version :", torch.__version__)
-print("CUDA available  :", torch.cuda.is_available())
-
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA is not available.")
-
-print("GPU             :", torch.cuda.get_device_name(0))
-
-vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-
-print("VRAM            :", round(vram, 2), "GB")
-
-if vram < 80:
-    raise RuntimeError(
-        f"GPU has only {vram:.1f} GB VRAM. "
-        "This deployment expects a high-memory GPU."
-    )
-
-print("==============================================")
-print()
-
-PY
-
-###############################################################################
-# 8. DOWNLOAD QWEN
-###############################################################################
-
-echo
-echo "[7/10] Downloading Qwen2.5-72B-Instruct-AWQ..."
-
-if [ ! -f "${MODEL_DIR}/config.json" ]; then
-
-    echo
-    echo "Downloading:"
-    echo "${MODEL_REPO}"
-    echo
-
-    huggingface-cli download \
+if [ -f "${MODEL_DIR}/config.json" ]; then
+    echo "Existing Qwen model found:"
+    echo "${MODEL_DIR}"
+    du -sh "${MODEL_DIR}"
+else
+    log "Qwen model not found. Downloading ${MODEL_REPO}"
+    mkdir -p "${MODEL_DIR}"
+    "${HF}" download \
         "${MODEL_REPO}" \
         --local-dir "${MODEL_DIR}"
-
-else
-
-    echo "Qwen model already downloaded."
-    echo "Skipping download."
-
 fi
 
-###############################################################################
-# 9. CONFIGURE TRADINGAGENTS
-###############################################################################
+[ -f "${MODEL_DIR}/config.json" ] || die "Qwen model is incomplete."
 
 echo
-echo "[8/10] Configuring TradingAgents..."
+echo "Qwen model:"
+echo "${MODEL_DIR}"
+du -sh "${MODEL_DIR}"
 
-cd "${TRADINGAGENTS_DIR}"
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
+
+log "Creating TradingAgents environment"
+
+cd "${REPO_DIR}"
 
 cat > .env <<EOF
-###############################################################################
-# Local Qwen/vLLM configuration
-###############################################################################
-
-OPENAI_API_KEY=dummy
-
-OPENAI_COMPATIBLE_API_KEY=dummy
-
+OPENAI_API_KEY=${API_KEY}
+OPENAI_COMPATIBLE_API_KEY=${API_KEY}
+OPENAI_BASE_URL=http://${HOST}:${PORT}/v1
 TRADINGAGENTS_LLM_PROVIDER=openai_compatible
-
 TRADINGAGENTS_DEEP_THINK_LLM=${MODEL_NAME}
-
 TRADINGAGENTS_QUICK_THINK_LLM=${MODEL_NAME}
-
-TRADINGAGENTS_LLM_BACKEND_URL=http://${VLLM_HOST}:${VLLM_PORT}/v1
-
+TRADINGAGENTS_LLM_BACKEND_URL=http://${HOST}:${PORT}/v1
 TRADINGAGENTS_OUTPUT_LANGUAGE=English
-
-TRADINGAGENTS_MAX_DEBATE_ROUNDS=2
-
-TRADINGAGENTS_MAX_RISK_ROUNDS=1
-
-TRADINGAGENTS_TEMPERATURE=0.1
-
 MAX_WORKERS=${MAX_WORKERS}
-
-OPENAI_BASE_URL=http://${VLLM_HOST}:${VLLM_PORT}/v1
 EOF
 
 chmod 600 .env
 
-###############################################################################
-# FIX USER SCRIPT CONFIGURATION
-###############################################################################
+# -----------------------------------------------------------------------------
+# Stop Qwen
+# -----------------------------------------------------------------------------
 
-echo
-echo "Checking trading.py..."
+log "Creating stop_qwen.sh"
 
-if [ ! -f "${TRADINGAGENTS_DIR}/trading.py" ]; then
-
-    echo
-    echo "ERROR: trading.py was not found in repository."
-    echo
-    exit 1
-
-fi
-
-###############################################################################
-# Patch Windows paths in trading.py
-###############################################################################
-
-python - <<PY
-
-from pathlib import Path
-
-path = Path("${TRADINGAGENTS_DIR}/trading.py")
-
-text = path.read_text(encoding="utf-8")
-
-# Windows TradingAgents path
-text = text.replace(
-    r"C:\Users\Administrator\Desktop\TradingAgents",
-    "${TRADINGAGENTS_DIR}"
-)
-
-# Windows reports path
-text = text.replace(
-    r"C:\Users\Administrator\Desktop\TradingAgents\reports",
-    "${REPORT_DIR}"
-)
-
-# Local model instead of OpenAI models
-text = text.replace(
-    'config["deep_think_llm"] = "gpt-5.5"',
-    'config["deep_think_llm"] = "${MODEL_NAME}"'
-)
-
-text = text.replace(
-    'config["quick_think_llm"] = "gpt-5.4-mini"',
-    'config["quick_think_llm"] = "${MODEL_NAME}"'
-)
-
-# Local provider
-text = text.replace(
-    'config["llm_provider"] = "openai"',
-    'config["llm_provider"] = "openai_compatible"'
-)
-
-# Direct summary call
-text = text.replace(
-    'model="gpt-4o"',
-    'model="${MODEL_NAME}"'
-)
-
-# Remove hard-coded OpenAI key if present.
-import re
-
-text = re.sub(
-    r'os\.environ\["OPENAI_API_KEY"\]\s*=\s*os\.getenv\([\s\S]*?\)\s*',
-    'os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "dummy")\n',
-    text,
-    count=1
-)
-
-path.write_text(text, encoding="utf-8")
-
-print("trading.py configured for local Qwen.")
-
-PY
-
-###############################################################################
-# 10. START vLLM
-###############################################################################
-
-echo
-echo "[9/10] Starting Qwen vLLM..."
-
-cat > "${BASE_DIR}/start_vllm.sh" <<EOF
+cat > "${BASE_DIR}/stop_qwen.sh" <<'EOF'
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 
-source "${VENV_DIR}/bin/activate"
+BASE_DIR="/root/TradingAI"
+PID_FILE="${BASE_DIR}/vllm.pid"
 
-exec vllm serve "${MODEL_DIR}" \\
-    --host "${VLLM_HOST}" \\
-    --port "${VLLM_PORT}" \\
-    --tensor-parallel-size 1 \\
-    --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION} \\
-    --max-model-len ${MAX_MODEL_LEN} \\
-    --max-num-seqs ${MAX_NUM_SEQS} \\
-    --enable-prefix-caching
-EOF
+echo "Stopping Qwen/vLLM..."
 
-chmod +x "${BASE_DIR}/start_vllm.sh"
-
-if pgrep -f "vllm serve" >/dev/null 2>&1; then
-
-    echo "vLLM already running."
-
-else
-
-    nohup "${BASE_DIR}/start_vllm.sh" \
-        > "${BASE_DIR}/vllm.log" \
-        2>&1 &
-
-    echo "vLLM started."
-
+if [ -f "${PID_FILE}" ]; then
+    PID=$(cat "${PID_FILE}" 2>/dev/null || true)
+    if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
+        echo "Stopping PID ${PID}"
+        kill -TERM "${PID}" 2>/dev/null || true
+        sleep 5
+        kill -KILL "${PID}" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}"
 fi
 
-###############################################################################
-# WAIT FOR SERVER
-###############################################################################
+pkill -TERM -f 'vllm serve' 2>/dev/null || true
+pkill -TERM -f 'VLLM::EngineCore' 2>/dev/null || true
+sleep 3
+pkill -KILL -f 'vllm serve' 2>/dev/null || true
+pkill -KILL -f 'VLLM::EngineCore' 2>/dev/null || true
+sleep 3
 
-echo
-echo "Waiting for Qwen..."
+nvidia-smi
+EOF
 
-READY=0
+chmod 755 "${BASE_DIR}/stop_qwen.sh"
 
-for i in $(seq 1 120); do
+# -----------------------------------------------------------------------------
+# Start Qwen
+# -----------------------------------------------------------------------------
 
-    if curl -sf \
-        "http://${VLLM_HOST}:${VLLM_PORT}/v1/models" \
-        >/dev/null 2>&1; then
+log "Creating start_qwen.sh"
 
-        READY=1
-        break
+cat > "${BASE_DIR}/start_qwen.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
+BASE_DIR="${BASE_DIR}"
+VLLM="${VLLM}"
+MODEL_DIR="${MODEL_DIR}"
+MODEL_NAME="${MODEL_NAME}"
+HOST="${HOST}"
+PORT="${PORT}"
+API_KEY="${API_KEY}"
+PID_FILE="${VLLM_PID}"
+LOG_FILE="${VLLM_LOG}"
+
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+if curl -fsS --max-time 5 \
+    "http://${HOST}:${PORT}/v1/models" \
+    -H "Authorization: Bearer ${API_KEY}" \
+    >/dev/null 2>&1; then
+    log "Qwen is already running."
+    exit 0
+fi
+
+log "Cleaning stale vLLM processes."
+
+if [ -f "${PID_FILE}" ]; then
+    PID=$(cat "${PID_FILE}" 2>/dev/null || true)
+    if [ -n "\${PID}" ] && kill -0 "\${PID}" 2>/dev/null; then
+        kill -TERM "\${PID}" 2>/dev/null || true
+        sleep 5
+        kill -KILL "\${PID}" 2>/dev/null || true
+    fi
+    rm -f "\${PID_FILE}"
+fi
+
+pkill -TERM -f 'vllm serve' 2>/dev/null || true
+pkill -TERM -f 'VLLM::EngineCore' 2>/dev/null || true
+sleep 3
+pkill -KILL -f 'vllm serve' 2>/dev/null || true
+pkill -KILL -f 'VLLM::EngineCore' 2>/dev/null || true
+sleep 3
+
+GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+
+echo "GPU memory currently used: ${GPU_USED} MiB"
+
+if [ "${GPU_USED}" -gt 5000 ]; then
+    echo "ERROR: GPU still has ${GPU_USED} MiB allocated."
+    nvidia-smi
+    exit 1
+fi
+
+[ -f "${MODEL_DIR}/config.json" ] || {
+    echo "ERROR: Model not found at ${MODEL_DIR}"
+    exit 1
+}
+
+for GPU_UTIL in 0.90 0.85 0.80; do
+    log "Starting Qwen with GPU utilization ${GPU_UTIL}"
+    : > "\${LOG_FILE}"
+
+    nohup "\${VLLM}" serve "\${MODEL_DIR}" \
+        --host "\${HOST}" \
+        --port "\${PORT}" \
+        --api-key "\${API_KEY}" \
+        --served-model-name "\${MODEL_NAME}" \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization "\${GPU_UTIL}" \
+        --max-model-len 16384 \
+        --max-num-seqs 6 \
+        --enable-prefix-caching \
+        >"\${LOG_FILE}" 2>&1 &
+
+    PID=\$!
+    echo "\${PID}" > "\${PID_FILE}"
+
+    log "vLLM PID: \${PID}"
+
+    READY=0
+
+    for i in \$(seq 1 180); do
+        if curl -fsS --max-time 5 \
+            "http://\${HOST}:\${PORT}/v1/models" \
+            -H "Authorization: Bearer \${API_KEY}" \
+            >/dev/null 2>&1; then
+            READY=1
+            break
+        fi
+
+        if ! kill -0 "\${PID}" 2>/dev/null; then
+            break
+        fi
+
+        sleep 2
+    done
+
+    if [ "\${READY}" -eq 1 ]; then
+        log "Qwen API is ready."
+
+        RESPONSE=\$(curl -fsS --max-time 120 \
+            "http://\${HOST}:\${PORT}/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer \${API_KEY}" \
+            -d '{
+                "model": "'"${MODEL_NAME}"'",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Reply with exactly QWEN_READY"
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 20
+            }')
+
+        echo "\${RESPONSE}" | jq .
+
+        if echo "\${RESPONSE}" | grep -q "QWEN_READY"; then
+            echo
+            echo "============================================================"
+            echo " QWEN READY"
+            echo "============================================================"
+            echo "Model       : \${MODEL_NAME}"
+            echo "Tensor      : 1"
+            echo "Context     : 16384"
+            echo "Sequences   : 6"
+            echo "GPU Util    : \${GPU_UTIL}"
+            echo "API         : http://\${HOST}:\${PORT}/v1"
+            echo "PID         : \${PID}"
+            echo "Log         : \${LOG_FILE}"
+            echo "============================================================"
+            exit 0
+        fi
     fi
 
-    printf "."
-    sleep 5
+    echo
+    echo "Qwen startup failed."
+    tail -100 "\${LOG_FILE}" || true
 
+    "\${BASE_DIR}/stop_qwen.sh" || true
+
+    GPU_USED=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+
+    if [ "\${GPU_USED}" -gt 5000 ]; then
+        echo "GPU remains occupied after cleanup."
+        nvidia-smi
+        exit 1
+    fi
 done
 
 echo
+echo "Qwen failed after all startup attempts."
+echo "Full log: ${LOG_FILE}"
+tail -200 "${LOG_FILE}" || true
+exit 1
+EOF
 
-if [ "${READY}" -ne 1 ]; then
+chmod 755 "${BASE_DIR}/start_qwen.sh"
 
+# -----------------------------------------------------------------------------
+# Status
+# -----------------------------------------------------------------------------
+
+log "Creating status.sh"
+
+cat > "${BASE_DIR}/status.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "================ GPU ================"
+nvidia-smi
+
+echo
+echo "================ vLLM ================"
+ps -ef | grep -i '[v]llm' || true
+
+echo
+echo "================ API ================"
+
+if curl -fsS --max-time 5 \
+    http://127.0.0.1:8000/v1/models \
+    -H 'Authorization: Bearer local-dummy-key' \
+    >/tmp/qwen_models.json 2>/dev/null; then
+    jq . /tmp/qwen_models.json
     echo
-    echo "ERROR: Qwen did not start successfully."
-    echo
-    echo "Last 100 lines of vLLM log:"
-    echo
-    tail -100 "${BASE_DIR}/vllm.log"
+    echo "STATUS: READY"
+else
+    echo "STATUS: NOT READY"
+fi
+EOF
 
-    exit 1
+chmod 755 "${BASE_DIR}/status.sh"
 
+# -----------------------------------------------------------------------------
+# TradingAgents runner
+# -----------------------------------------------------------------------------
+
+log "Creating run_trading.sh"
+
+cat > "${BASE_DIR}/run_trading.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE_DIR="${BASE_DIR}"
+REPO_DIR="${REPO_DIR}"
+PYTHON="${PYTHON}"
+API_URL="http://${HOST}:${PORT}/v1"
+API_KEY="${API_KEY}"
+MODEL_NAME="${MODEL_NAME}"
+
+if ! curl -fsS --max-time 5 \
+    "${API_URL}/models" \
+    -H "Authorization: Bearer ${API_KEY}" \
+    >/dev/null 2>&1; then
+    echo "Qwen is not running. Starting it..."
+    "${BASE_DIR}/start_qwen.sh"
 fi
 
-###############################################################################
-# TEST QWEN
-###############################################################################
+curl -fsS --max-time 10 \
+    "${API_URL}/models" \
+    -H "Authorization: Bearer ${API_KEY}" \
+    >/dev/null \
+    || {
+        echo "ERROR: Qwen API is unavailable."
+        exit 1
+    }
 
-echo
-echo "[10/10] Testing Qwen..."
+cd "${REPO_DIR}"
 
-curl -sf \
-    "http://${VLLM_HOST}:${VLLM_PORT}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d "{
-        \"model\": \"${MODEL_NAME}\",
-        \"messages\": [
-            {
-                \"role\": \"user\",
-                \"content\": \"Reply with exactly QWEN_READY\"
-            }
-        ],
-        \"temperature\": 0,
-        \"max_tokens\": 20
-    }" | jq .
-
-###############################################################################
-# RUN TRADINGAGENTS
-###############################################################################
-
-echo
-echo
-echo "=============================================================="
-echo " QWEN IS READY"
-echo "=============================================================="
-echo
-echo "Repository : ${TRADINGAGENTS_DIR}"
-echo "Model      : ${MODEL_NAME}"
-echo "GPU        : RTX PRO 6000 96GB"
-echo "Tensor TP  : 1"
-echo "Max Seq    : 6"
-echo "Workers    : 6"
-echo "API        : http://${VLLM_HOST}:${VLLM_PORT}/v1"
-echo
-echo "Starting TradingAgents..."
-echo "=============================================================="
-echo
-
-cd "${TRADINGAGENTS_DIR}"
-
-source "${VENV_DIR}/bin/activate"
-
-export OPENAI_API_KEY=dummy
-export OPENAI_COMPATIBLE_API_KEY=dummy
-
-export OPENAI_BASE_URL="http://${VLLM_HOST}:${VLLM_PORT}/v1"
-
+export OPENAI_API_KEY="${API_KEY}"
+export OPENAI_BASE_URL="${API_URL}"
+export OPENAI_COMPATIBLE_API_KEY="${API_KEY}"
 export TRADINGAGENTS_LLM_PROVIDER="openai_compatible"
-
 export TRADINGAGENTS_DEEP_THINK_LLM="${MODEL_NAME}"
-
 export TRADINGAGENTS_QUICK_THINK_LLM="${MODEL_NAME}"
-
-export TRADINGAGENTS_LLM_BACKEND_URL="http://${VLLM_HOST}:${VLLM_PORT}/v1"
-
-export TRADINGAGENTS_OUTPUT_LANGUAGE="English"
-
-python trading.py
+export TRADINGAGENTS_LLM_BACKEND_URL="${API_URL}"
+export MAX_WORKERS="${MAX_WORKERS}"
 
 echo
-echo "=============================================================="
-echo " TradingAgents execution completed"
-echo "=============================================================="
+echo "============================================================"
+echo " Starting TradingAgents"
+echo "============================================================"
+echo "Repository : ${REPO_DIR}"
+echo "Model      : ${MODEL_NAME}"
+echo "Workers    : ${MAX_WORKERS}"
+echo "API        : ${API_URL}"
+echo "============================================================"
+echo
+
+exec "${PYTHON}" trading.py
+EOF
+
+chmod 755 "${BASE_DIR}/run_trading.sh"
+
+# -----------------------------------------------------------------------------
+# Validate
+# -----------------------------------------------------------------------------
+
+log "Validating installation"
+
+"${PYTHON}" - <<'PY'
+import torch
+import vllm
+import setuptools
+
+print("setuptools:", setuptools.__version__)
+print("torch:", torch.__version__)
+print("vLLM:", vllm.__version__)
+print("CUDA:", torch.cuda.is_available())
+
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is unavailable.")
+
+print("GPU:", torch.cuda.get_device_name(0))
+print("VRAM:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2), "GB")
+PY
+
+# -----------------------------------------------------------------------------
+# Secret check
+# -----------------------------------------------------------------------------
+
+log "Checking repository for hard-coded OpenAI keys"
+
+if grep -R \
+    --exclude-dir=.git \
+    --exclude-dir=venv \
+    --exclude-dir=.venv \
+    -nE 'sk-(proj-)?[A-Za-z0-9_-]{20,}' \
+    "${REPO_DIR}" \
+    >/tmp/tradingagents_secret_scan.txt 2>/dev/null; then
+    echo
+    cat /tmp/tradingagents_secret_scan.txt
+    echo
+    die "Possible hard-coded OpenAI API key found in repository."
+fi
+
+echo "No obvious sk-* API key found."
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " SETUP COMPLETE"
+echo "============================================================"
+echo
+echo "Installation : ${BASE_DIR}"
+echo "Repository   : ${REPO_DIR}"
+echo "Python       : ${VENV}"
+echo "Qwen model   : ${MODEL_DIR}"
+echo
+echo "Scripts:"
+echo "  ${BASE_DIR}/start_qwen.sh"
+echo "  ${BASE_DIR}/stop_qwen.sh"
+echo "  ${BASE_DIR}/status.sh"
+echo "  ${BASE_DIR}/run_trading.sh"
+echo
+echo "============================================================"
+
+# -----------------------------------------------------------------------------
+# Start Qwen and validate inference
+# -----------------------------------------------------------------------------
+
+log "Starting Qwen"
+
+"${BASE_DIR}/start_qwen.sh"
+
+echo
+echo "============================================================"
+echo " QWEN SETUP COMPLETE"
+echo "============================================================"
+echo
+echo "Start Qwen:"
+echo "  ${BASE_DIR}/start_qwen.sh"
+echo
+echo "Stop Qwen:"
+echo "  ${BASE_DIR}/stop_qwen.sh"
+echo
+echo "Status:"
+echo "  ${BASE_DIR}/status.sh"
+echo
+echo "Run TradingAgents:"
+echo "  ${BASE_DIR}/run_trading.sh"
+echo
+echo "============================================================"
