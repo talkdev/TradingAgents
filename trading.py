@@ -341,13 +341,14 @@ def analyze_stocks():
     config["max_debate_rounds"] = 2
     config["max_risk_discuss_rounds"] = 1
     
-    # ====================================================
-    # ADD THESE DATA TRUNCATION LIMITS TO PREVENT 400 ERRORS
-    # ====================================================
-    config["news_article_limit"] = 5         # Default is 20. Cuts ticker news heavily.
-    config["global_news_article_limit"] = 3  # Default is 10. Cuts macro news heavily.
-    # ====================================================
-
+    # ---------------------------------------------------------
+    # OPTIONAL FIX: Disable Polymarket to stop DNS error logs
+    # ---------------------------------------------------------
+    if "data_vendors" not in config:
+        config["data_vendors"] = {}
+    config["data_vendors"]["prediction_markets"] = None 
+    
+    # India-specific queries
     config["global_news_queries"] = [
         "RBI Reserve Bank of India interest rates inflation",
         "Nifty 50 Sensex Indian economy GDP",
