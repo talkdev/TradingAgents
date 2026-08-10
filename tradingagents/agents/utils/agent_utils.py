@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, RemoveMessage
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import get_stock_data
+from tradingagents.dataflows.stockstats_utils import yf_retry
 from tradingagents.agents.utils.fundamental_data_tools import (
     get_balance_sheet,
     get_cashflow,
@@ -96,7 +97,7 @@ def resolve_instrument_identity(ticker: str) -> dict:
     from tradingagents.dataflows.symbol_utils import normalize_symbol
 
     try:
-        info = yf.Ticker(normalize_symbol(ticker)).info or {}
+        info = yf_retry(lambda: yf.Ticker(normalize_symbol(ticker)).info) or {}
     except Exception as exc:  # noqa: BLE001 — fail open, never block the run
         logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)
         return {}

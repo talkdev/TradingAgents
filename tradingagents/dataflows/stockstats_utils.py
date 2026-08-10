@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 from typing import Annotated
 
@@ -25,17 +26,26 @@ MAX_OHLCV_STALE_DAYS = 10
 # at all (weekend, holiday) cannot trigger a download on every call.
 OHLCV_CACHE_TTL_SECONDS = 900
 
+# yfinance shares one cookie/crumb session inside a Python process.  Parallel
+# graph workers can otherwise refresh that shared crumb at the same instant,
+# leaving sibling requests with an invalid token and producing Yahoo 401s.
+# Keep Yahoo-bound operations serialized; the rest of each stock's analysis
+# (LLM work, report writing, and non-Yahoo data) still runs concurrently.
+_YAHOO_REQUEST_LOCK = threading.RLock()
+
 
 def yf_retry(func, max_retries=3, base_delay=2.0):
-    """Execute a yfinance call with exponential backoff on rate limits.
+    """Execute one yfinance call safely with rate-limit backoff.
 
-    yfinance raises YFRateLimitError on HTTP 429 responses but does not
-    retry them internally. This wrapper adds retry logic specifically
-    for rate limits. Other exceptions propagate immediately.
+    yfinance raises ``YFRateLimitError`` on HTTP 429 responses but does not
+    retry them internally.  Its cookie/crumb state is also process-global, so
+    the actual request is protected by a shared lock to prevent concurrent
+    workers invalidating each other's Yahoo session.
     """
     for attempt in range(max_retries + 1):
         try:
-            return func()
+            with _YAHOO_REQUEST_LOCK:
+                return func()
         except YFRateLimitError:
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)

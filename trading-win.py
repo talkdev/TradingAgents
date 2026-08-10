@@ -89,6 +89,11 @@ def record_run_to_db(db_path, target_date, status_dict):
         print(f"[✔] Successfully recorded execution statuses in local DB for {target_date}")
 
 
+def _markdown_table_cell(value) -> str:
+    """Return a safe, single-line Markdown table cell value."""
+    return str(value or "").replace("\\", "\\\\").replace("|", "\\|").replace("\r", "").replace("\n", "<br>")
+
+
 def generate_change_report(db_path, target_date, output_folder):
     """
     Queries DB for status changes compared to the previous run date,
@@ -158,15 +163,19 @@ def generate_change_report(db_path, target_date, output_folder):
 
     # Build Markdown Report
     report_md = f"# Trading Signal Change Report — {current_date}\n"
-    report_md += f"**Comparison Window:** `{prev_date}` $\\rightarrow$ `{current_date}`\n\n"
+    report_md += f"**Comparison Window:** `{prev_date}` → `{current_date}`\n\n"
     report_md += "---\n\n"
 
     report_md += "## 🚨 Stocks with Status Changes\n\n"
     if changes:
         report_md += "| Stock Symbol | Previous Stance (`" + prev_date + "`) | New Stance (`" + current_date + "`) |\n"
         report_md += "| :--- | :--- | :--- |\n"
-        for ticker, p_val, c_val in changes:
-            report_md += f"| **{ticker}** | `{p_val}` | **`{c_val}`** |\n"
+        for ticker, p_val, c_val in sorted(changes):
+            report_md += (
+                f"| `{_markdown_table_cell(ticker)}` | "
+                f"`{_markdown_table_cell(p_val)}` | "
+                f"`{_markdown_table_cell(c_val)}` |\n"
+            )
     else:
         report_md += "*No stocks changed status compared to the previous run.*\n"
 
@@ -175,8 +184,10 @@ def generate_change_report(db_path, target_date, output_folder):
     if unchanged:
         report_md += "| Stock Symbol | Sustained Stance |\n"
         report_md += "| :--- | :--- |\n"
-        for ticker, val in unchanged:
-            report_md += f"| {ticker} | `{val}` |\n"
+        for ticker, val in sorted(unchanged):
+            report_md += f"| `{_markdown_table_cell(ticker)}` | `{_markdown_table_cell(val)}` |\n"
+    else:
+        report_md += "*No stocks retained the same status compared to the previous run.*\n"
 
     with open(summary_file_path, "w", encoding="utf-8") as f:
         f.write(report_md)

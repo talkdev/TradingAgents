@@ -29,6 +29,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.stockstats_utils import yf_retry
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
@@ -269,8 +270,14 @@ class TradingAgentsGraph:
             # Normalize so the realized-return lookup hits the same instrument
             # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
             # already a canonical Yahoo symbol from ``_resolve_benchmark``.
-            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            stock = yf_retry(
+                lambda: yf.Ticker(normalize_symbol(ticker)).history(
+                    start=trade_date, end=end_str
+                )
+            )
+            bench = yf_retry(
+                lambda: yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            )
 
             if len(stock) < 2 or len(bench) < 2:
                 return None, None, None
